@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use rand::thread_rng;
 use rand::Rng;
-use temujsx_core::{Extractor, Mutator, Concretizer, Engine, load_seed_paths, read_to_string};
+use kre8ntemjs_core::{Extractor, Mutator, Concretizer, Engine, load_seed_paths, read_to_string};
 
 /// Simple CLI for the MVP fuzzer.
 #[derive(Parser, Debug)]
@@ -61,7 +61,7 @@ fn main() -> anyhow::Result<()> {
             let other = &seeds[rng.gen_range(0..seeds.len())];
             let other_src = read_to_string(other)?;
             let tpl_b = extractor.extract(&other_src);
-            temujsx_core::Mutator::fuse(&tpl_a, &tpl_b)
+            kre8ntemjs_core::Mutator::fuse(&tpl_a, &tpl_b)
         } else {
             tpl_a
         };
