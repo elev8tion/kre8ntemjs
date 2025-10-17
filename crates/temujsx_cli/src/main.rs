@@ -50,6 +50,10 @@ fn main() -> anyhow::Result<()> {
     let extractor = Extractor::default();
     let mut rng = thread_rng();
 
+    let mut syntax_errors = 0u64;
+    let mut crashes = 0u64;
+    let mut timeouts = 0u64;
+
     for i in 0..args.iters {
         // pick a random seed and extract template
         let seed_path = seeds[rng.gen_range(0..seeds.len())].clone();
@@ -79,19 +83,39 @@ fn main() -> anyhow::Result<()> {
         // run
         let outcome = eng.run_js(&prog)?;
 
-        // save interesting cases
-        if outcome.timed_out || outcome.status != 0 {
-            let tag = if outcome.timed_out { "timeout" } else { "crash" };
-            let path = args.out.join(format!("{}_iter{}_status{}.js", tag, i, outcome.status));
+        // Filter out plain syntax errors; keep real crashes/timeouts.
+        let is_syntax_error = outcome.stderr.contains("SyntaxError")
+            || outcome.stderr.contains("Parse error")
+            || outcome.stderr.contains("Unexpected token");
+
+        if outcome.timed_out {
+            timeouts += 1;
+            let path = args.out.join(format!("timeout_iter{}_status{}.js", i, outcome.status));
             std::fs::write(&path, &prog)?;
-            let stderr_path = args.out.join(format!("{}_iter{}_status{}.stderr.txt", tag, i, outcome.status));
+            let stderr_path = args.out.join(format!("timeout_iter{}_status{}.stderr.txt", i, outcome.status));
             std::fs::write(&stderr_path, &outcome.stderr)?;
+        } else if outcome.status != 0 {
+            if is_syntax_error {
+                syntax_errors += 1;
+            } else {
+                crashes += 1;
+                let path = args.out.join(format!("crash_iter{}_status{}.js", i, outcome.status));
+                std::fs::write(&path, &prog)?;
+                let stderr_path = args.out.join(format!("crash_iter{}_status{}.stderr.txt", i, outcome.status));
+                std::fs::write(&stderr_path, &outcome.stderr)?;
+            }
         }
 
         if i % 100 == 0 {
-            eprintln!("iter {i} ok");
+            eprintln!("iter {i}: syntax_errors={syntax_errors}, crashes={crashes}, timeouts={timeouts}");
         }
     }
+
+    eprintln!("\n=== Final Stats ===");
+    eprintln!("Total iterations: {}", args.iters);
+    eprintln!("Syntax errors (filtered): {}", syntax_errors);
+    eprintln!("Real crashes: {}", crashes);
+    eprintln!("Timeouts: {}", timeouts);
 
     Ok(())
 }

@@ -79,16 +79,21 @@ pub struct Mutator;
 
 impl Mutator {
     pub fn insert_placeholder<R: Rng>(tpl: &Template, rng: &mut R) -> Template {
-        // naive: insert a placeholder token at a random byte boundary between tokens
-        let choices = ["<integer>", "<var>", "<code_str>"];
-        let choice = choices.choose(rng).unwrap();
-        let bytes = tpl.source.as_bytes();
-        let idx = if bytes.is_empty() { 0 } else { rng.gen_range(0..=bytes.len()) };
-        let mut s = String::with_capacity(tpl.source.len() + choice.len());
-        let (left, right) = tpl.source.split_at(idx);
-        s.push_str(left);
-        s.push_str(choice);
-        s.push_str(right);
+        // Insert a full statement template at a line boundary.
+        // These are syntactically self-contained and contain placeholders.
+        const STMT_TEMPLATES: &[&str] = &[
+            "let <var> = <integer>;\n",
+            "const <var> = <integer>;\n",
+            "function <var>(){ return <integer>; }\n<var>();\n",
+            "try { <var> = <integer>; } catch (e) {}\n",
+            "({ toString() { return <code_str>; } });\n",
+            "for (let <var> = 0; <var> < <integer>; <var>++) { }\n",
+        ];
+        let mut lines: Vec<&str> = tpl.source.split('\n').collect();
+        let insert_at = if lines.is_empty() { 0 } else { rng.gen_range(0..=lines.len()) };
+        let stmt = STMT_TEMPLATES.choose(rng).unwrap();
+        lines.insert(insert_at, stmt);
+        let s = lines.join("\n");
         Template::from_source(&s)
     }
 
