@@ -10,7 +10,7 @@ name = "kre8ntemjs"
 path = "src/main.rs"
 
 [dependencies]
-kre8ntemjs_core = { path = "../temujsx_core" }
+kre8ntemjs_core = { path = "../kre8ntemjs_core" }
 clap = { version = "4.0", features = ["derive"] }
 anyhow = "1.0"
 rand = "0.8"
