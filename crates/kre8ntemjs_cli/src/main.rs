@@ -117,20 +117,23 @@ fn main() -> anyhow::Result<()> {
                 std::fs::write(&stderr_path, &outcome.stderr)?;
             }
         } else if outcome.status != 0 && !is_syntax_error {
-            let sig = crash_signature(&outcome.stderr);
-            if seen.insert(sig.clone()) {
-                crashes += 1;
-                // Minimize the crash
-                let minimized = match kre8ntemjs_core::minimizer::minimize_by(&prog, &eng, |stderr| {
-                    crash_signature(stderr) == sig
-                }) {
-                    Ok(m) => m,
-                    Err(_) => prog.clone(),
-                };
-                let path = args.out.join(format!("crash_iter{}_sig{}.js", i, &sig[..8]));
-                std::fs::write(&path, &minimized)?;
-                let stderr_path = args.out.join(format!("crash_iter{}_sig{}.stderr.txt", i, &sig[..8]));
-                std::fs::write(&stderr_path, &outcome.stderr)?;
+            let boring = outcome.stderr.contains("ReferenceError:") && !outcome.stderr.contains("prototype");
+            if !boring {
+                let sig = crash_signature(&outcome.stderr);
+                if seen.insert(sig.clone()) {
+                    crashes += 1;
+                    // Minimize the crash
+                    let minimized = match kre8ntemjs_core::minimizer::minimize_by(&prog, &eng, |stderr| {
+                        crash_signature(stderr) == sig
+                    }) {
+                        Ok(m) => m,
+                        Err(_) => prog.clone(),
+                    };
+                    let path = args.out.join(format!("crash_iter{}_sig{}.js", i, &sig[..8]));
+                    std::fs::write(&path, &minimized)?;
+                    let stderr_path = args.out.join(format!("crash_iter{}_sig{}.stderr.txt", i, &sig[..8]));
+                    std::fs::write(&stderr_path, &outcome.stderr)?;
+                }
             }
         }
 

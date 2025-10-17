@@ -13,6 +13,7 @@ use thiserror::Error;
 
 pub mod ast;
 pub mod minimizer;
+pub mod dataflow;
 
 #[derive(Debug, Error)]
 pub enum FuzzError {
@@ -69,28 +70,56 @@ impl Default for Extractor {
 
 impl Extractor {
     pub fn extract(&self, src: &str) -> Template {
-        // AST pass to find numeric literals & lexical decl ids
+        // AST path (existing)
         let mut js = crate::ast::JsAst::default();
-        if let Some(tree) = js.parse(src) {
-            // Collect edits as (start_byte, end_byte, replacement)
-            let mut edits: Vec<(usize, usize, &'static str)> = Vec::new();
+        if let Ok(tree) = js.parse(src) {
+            use rand::{thread_rng, Rng};
+            use crate::dataflow::{JsDf, dfcomp};
+
+            // 1) dataflow
+            let mut df = JsDf::default();
+            let report = df.analyze(src).ok();
+            let comp = report.as_ref().map(dfcomp);
+
+            // 2) walk AST, build edits: numbers -> <integer>, some identifiers -> <var> with bias
             let root = tree.root_node();
             let mut cursor = root.walk();
             let mut stack = vec![root];
+            let mut edits: Vec<(usize, usize, &'static str)> = Vec::new();
+
+            // Precompute total weight for identifiers if we have DF report
+            let (weights, total): (std::collections::HashMap<String, usize>, usize) = if let Some(c) = &comp {
+                let t = c.values().copied().sum::<usize>().max(1);
+                (c.clone(), t)
+            } else {
+                (std::collections::HashMap::new(), 0)
+            };
+
+            let mut rng = thread_rng();
+
             while let Some(n) = stack.pop() {
-                let kind = n.kind();
-                match kind {
+                match n.kind() {
                     "number" => edits.push((n.start_byte(), n.end_byte(), "<integer>")),
                     "identifier" => {
-                        if let Some(parent) = n.parent() {
-                            // Only replace identifiers on the left side of decls
-                            if matches!(parent.kind(), "variable_declarator" | "lexical_declaration") {
-                                edits.push((n.start_byte(), n.end_byte(), "<var>"));
+                        // decide probabilistically based on DFComp
+                        let name = n.utf8_text(src.as_bytes()).unwrap_or("");
+                        let w = *weights.get(name).unwrap_or(&1);
+                        let t = if total == 0 { 1 } else { total };
+                        // p = w / (t / K) ~ scale up a bit; tweak factor if too aggressive
+                        let p = (w as f64) / ((t as f64) / 8.0);
+                        let coin = rng.gen::<f64>();
+                        if coin < p {
+                            // only replace if it's a declaration name or safe spot
+                            if let Some(parent) = n.parent() {
+                                if matches!(parent.kind(), "variable_declarator" | "function_declaration" | "class_declaration") {
+                                    edits.push((n.start_byte(), n.end_byte(), "<var>"));
+                                }
                             }
                         }
                     }
                     _ => {}
                 }
+
                 if n.child_count() > 0 {
                     cursor.reset(n);
                     for i in 0..n.child_count() {
@@ -98,15 +127,15 @@ impl Extractor {
                     }
                 }
             }
-            // Apply edits from right to left
+
+            // apply edits right-to-left
             let mut s = src.to_string();
             edits.sort_by_key(|e| std::cmp::Reverse(e.0));
-            for (start, end, rep) in edits {
-                s.replace_range(start..end, rep);
-            }
+            for (start, end, rep) in edits { s.replace_range(start..end, rep); }
             return Template::from_source(&s);
         }
-        // Fallback to regex if parse fails
+
+        // Fallback: regex
         let mut s = self.re_int.replace_all(src, "<integer>").to_string();
         s = self.re_var_decl.replace_all(&s, "let <var>").to_string();
         Template::from_source(&s)
@@ -183,11 +212,22 @@ impl Concretizer {
             let val = rng.gen_range(-10_000..=10_000);
             out.replace_range(pos..pos+"<integer>".len(), &val.to_string());
         }
-        // Replace <var>
-        let names = ["a","b","c","x","y","z","tmp","obj","v"];
+        // Build a pool of existing identifiers to keep scope coherence.
+        let mut id_pool: Vec<String> = Vec::new();
+        {
+            let re = Regex::new(r"\b([A-Za-z_]\w*)\b").unwrap();
+            for cap in re.captures_iter(&out) {
+                let s = &cap[1];
+                // skip keywords roughly
+                if !matches!(s, "let" | "const" | "var" | "function" | "class" | "try" | "catch" | "for" | "return") {
+                    id_pool.push(s.to_string());
+                }
+            }
+            id_pool.extend(["a","b","c","x","y","z","tmp","obj","v"].into_iter().map(|s| s.to_string()));
+        }
         while let Some(pos) = out.find("<var>") {
-            let name = names.choose(rng).unwrap();
-            out.replace_range(pos..pos+"<var>".len(), name);
+            let name = id_pool.choose(rng).unwrap().clone();
+            out.replace_range(pos..pos+"<var>".len(), &name);
         }
         // Replace <code_str> with quoted snippet
         while let Some(pos) = out.find("<code_str>") {
@@ -266,6 +306,44 @@ impl Engine {
                 let out = String::new();
                 let err = "timeout".to_string();
                 return Ok(RunOutcome { status: -1, timed_out, stdout: out, stderr: err });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Run with additional one-off args (for coverage/profiling second pass).
+    pub fn run_js_with_args(&self, js: &str, extra_args: &[String]) -> Result<RunOutcome> {
+        use std::io::Read;
+        let tmp = tempfile::NamedTempFile::new()?;
+        std::fs::write(tmp.path(), js)?;
+        let mut args = self.args.clone();
+        args.extend_from_slice(extra_args);
+        args.push(tmp.path().to_string_lossy().to_string());
+        let mut child = std::process::Command::new(&self.cmd)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to spawn engine {}", self.cmd))?;
+        let start = std::time::Instant::now();
+        let mut timed_out = false;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                let mut out = String::new();
+                if let Some(mut so) = child.stdout.take() { so.read_to_string(&mut out).ok(); }
+                let mut err = String::new();
+                if let Some(mut se) = child.stderr.take() { se.read_to_string(&mut err).ok(); }
+                return Ok(RunOutcome {
+                    status: status.code().unwrap_or(-1),
+                    timed_out,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+            if start.elapsed() >= self.timeout {
+                timed_out = true;
+                child.kill().ok();
+                return Ok(RunOutcome { status: -1, timed_out, stdout: String::new(), stderr: "timeout".into() });
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
