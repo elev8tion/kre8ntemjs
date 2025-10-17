@@ -2,9 +2,23 @@
 use clap::{Parser};
 use std::path::PathBuf;
 use std::time::Duration;
+use std::collections::HashSet;
 use rand::thread_rng;
 use rand::Rng;
+use sha1::{Digest, Sha1};
+use regex::Regex;
 use kre8ntemjs_core::{Extractor, Mutator, Concretizer, Engine, load_seed_paths, read_to_string};
+
+fn crash_signature(stderr: &str) -> String {
+    // Normalize unstable bits (paths, line numbers, hex ptrs)
+    let re_hex = Regex::new(r"0x[0-9a-fA-F]+").unwrap();
+    let re_line = Regex::new(r":\d+(:\d+)?").unwrap();
+    let after_hex = re_hex.replace_all(stderr, "0xHEX");
+    let norm = re_line.replace_all(&after_hex, ":LINE");
+    let mut h = Sha1::new();
+    h.update(norm.as_bytes());
+    format!("{:x}", h.finalize())
+}
 
 /// Simple CLI for the MVP fuzzer.
 #[derive(Parser, Debug)]
@@ -50,9 +64,10 @@ fn main() -> anyhow::Result<()> {
     let extractor = Extractor::default();
     let mut rng = thread_rng();
 
-    let mut syntax_errors = 0u64;
-    let mut crashes = 0u64;
-    let mut timeouts = 0u64;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut syntax_errors = 0usize;
+    let mut crashes = 0usize;
+    let mut timeouts = 0usize;
 
     for i in 0..args.iters {
         // pick a random seed and extract template
@@ -88,34 +103,44 @@ fn main() -> anyhow::Result<()> {
             || outcome.stderr.contains("Parse error")
             || outcome.stderr.contains("Unexpected token");
 
+        if is_syntax_error {
+            syntax_errors += 1;
+        }
+
         if outcome.timed_out {
             timeouts += 1;
-            let path = args.out.join(format!("timeout_iter{}_status{}.js", i, outcome.status));
-            std::fs::write(&path, &prog)?;
-            let stderr_path = args.out.join(format!("timeout_iter{}_status{}.stderr.txt", i, outcome.status));
-            std::fs::write(&stderr_path, &outcome.stderr)?;
-        } else if outcome.status != 0 {
-            if is_syntax_error {
-                syntax_errors += 1;
-            } else {
-                crashes += 1;
-                let path = args.out.join(format!("crash_iter{}_status{}.js", i, outcome.status));
+            let sig = crash_signature(&outcome.stderr);
+            if seen.insert(sig.clone()) {
+                let path = args.out.join(format!("timeout_iter{}_sig{}.js", i, &sig[..8]));
                 std::fs::write(&path, &prog)?;
-                let stderr_path = args.out.join(format!("crash_iter{}_status{}.stderr.txt", i, outcome.status));
+                let stderr_path = args.out.join(format!("timeout_iter{}_sig{}.stderr.txt", i, &sig[..8]));
+                std::fs::write(&stderr_path, &outcome.stderr)?;
+            }
+        } else if outcome.status != 0 && !is_syntax_error {
+            let sig = crash_signature(&outcome.stderr);
+            if seen.insert(sig.clone()) {
+                crashes += 1;
+                // Minimize the crash
+                let minimized = match kre8ntemjs_core::minimizer::minimize_by(&prog, &eng, |stderr| {
+                    crash_signature(stderr) == sig
+                }) {
+                    Ok(m) => m,
+                    Err(_) => prog.clone(),
+                };
+                let path = args.out.join(format!("crash_iter{}_sig{}.js", i, &sig[..8]));
+                std::fs::write(&path, &minimized)?;
+                let stderr_path = args.out.join(format!("crash_iter{}_sig{}.stderr.txt", i, &sig[..8]));
                 std::fs::write(&stderr_path, &outcome.stderr)?;
             }
         }
 
         if i % 100 == 0 {
-            eprintln!("iter {i}: syntax_errors={syntax_errors}, crashes={crashes}, timeouts={timeouts}");
+            eprintln!("iter {i} | syntax={syntax_errors} unique_crashes={crashes} timeouts={timeouts}");
         }
     }
 
-    eprintln!("\n=== Final Stats ===");
-    eprintln!("Total iterations: {}", args.iters);
-    eprintln!("Syntax errors (filtered): {}", syntax_errors);
-    eprintln!("Real crashes: {}", crashes);
-    eprintln!("Timeouts: {}", timeouts);
+    eprintln!("\n=== summary ===");
+    eprintln!("syntax={syntax_errors} unique_crashes={crashes} timeouts={timeouts}");
 
     Ok(())
 }

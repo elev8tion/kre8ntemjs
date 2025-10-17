@@ -11,6 +11,9 @@ use walkdir::WalkDir;
 use anyhow::{Result, Context};
 use thiserror::Error;
 
+pub mod ast;
+pub mod minimizer;
+
 #[derive(Debug, Error)]
 pub enum FuzzError {
     #[error("engine failed with status: {0}")]
@@ -66,9 +69,45 @@ impl Default for Extractor {
 
 impl Extractor {
     pub fn extract(&self, src: &str) -> Template {
-        // Replace numbers with <integer>
+        // AST pass to find numeric literals & lexical decl ids
+        let mut js = crate::ast::JsAst::default();
+        if let Some(tree) = js.parse(src) {
+            // Collect edits as (start_byte, end_byte, replacement)
+            let mut edits: Vec<(usize, usize, &'static str)> = Vec::new();
+            let root = tree.root_node();
+            let mut cursor = root.walk();
+            let mut stack = vec![root];
+            while let Some(n) = stack.pop() {
+                let kind = n.kind();
+                match kind {
+                    "number" => edits.push((n.start_byte(), n.end_byte(), "<integer>")),
+                    "identifier" => {
+                        if let Some(parent) = n.parent() {
+                            // Only replace identifiers on the left side of decls
+                            if matches!(parent.kind(), "variable_declarator" | "lexical_declaration") {
+                                edits.push((n.start_byte(), n.end_byte(), "<var>"));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if n.child_count() > 0 {
+                    cursor.reset(n);
+                    for i in 0..n.child_count() {
+                        if let Some(c) = n.child(i) { stack.push(c); }
+                    }
+                }
+            }
+            // Apply edits from right to left
+            let mut s = src.to_string();
+            edits.sort_by_key(|e| std::cmp::Reverse(e.0));
+            for (start, end, rep) in edits {
+                s.replace_range(start..end, rep);
+            }
+            return Template::from_source(&s);
+        }
+        // Fallback to regex if parse fails
         let mut s = self.re_int.replace_all(src, "<integer>").to_string();
-        // Optionally replace var names in declarations with <var>
         s = self.re_var_decl.replace_all(&s, "let <var>").to_string();
         Template::from_source(&s)
     }
@@ -79,22 +118,31 @@ pub struct Mutator;
 
 impl Mutator {
     pub fn insert_placeholder<R: Rng>(tpl: &Template, rng: &mut R) -> Template {
-        // Insert a full statement template at a line boundary.
-        // These are syntactically self-contained and contain placeholders.
-        const STMT_TEMPLATES: &[&str] = &[
-            "let <var> = <integer>;\n",
-            "const <var> = <integer>;\n",
-            "function <var>(){ return <integer>; }\n<var>();\n",
-            "try { <var> = <integer>; } catch (e) {}\n",
-            "({ toString() { return <code_str>; } });\n",
-            "for (let <var> = 0; <var> < <integer>; <var>++) { }\n",
-        ];
+        // AST-safe insertion using statement nodes
+        let mut js = crate::ast::JsAst::default();
+        if let Some(tree) = js.parse(&tpl.source) {
+            let stmts = crate::ast::collect_statement_nodes(&tree, &tpl.source);
+            let stmt_tmpls = [
+                "let <var> = <integer>;",
+                "const <var> = <integer>;",
+                "function <var>(){ return <integer>; } <var>();",
+                "try { <var> = <integer>; } catch (e) {}",
+                "for (let <var> = 0; <var> < <integer>; <var>++) { }",
+                "({ toString(){ return <code_str>; } });",
+            ];
+            let insertion = stmt_tmpls.choose(rng).unwrap();
+            let target = stmts.choose(rng).copied();
+            if let Some(node) = target {
+                let s = crate::ast::insert_at_node(&tpl.source, node, insertion);
+                return Template::from_source(&s);
+            }
+        }
+        // Fallback to old line-boundary insertion if parse fails
         let mut lines: Vec<&str> = tpl.source.split('\n').collect();
-        let insert_at = if lines.is_empty() { 0 } else { rng.gen_range(0..=lines.len()) };
-        let stmt = STMT_TEMPLATES.choose(rng).unwrap();
-        lines.insert(insert_at, stmt);
-        let s = lines.join("\n");
-        Template::from_source(&s)
+        let idx = if lines.is_empty() { 0 } else { rng.gen_range(0..=lines.len()) };
+        let stmt = "let <var> = <integer>;";
+        lines.insert(idx, stmt);
+        Template::from_source(&lines.join("\n"))
     }
 
     pub fn delete_placeholder(tpl: &Template) -> Template {
