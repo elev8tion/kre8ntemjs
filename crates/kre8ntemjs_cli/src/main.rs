@@ -20,6 +20,25 @@ fn crash_signature(stderr: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+fn score_with_regex(out: &str, err: &str, re: &Regex) -> u64 {
+    let mut sum = 0u64;
+    for cap in re.captures_iter(out) {
+        for i in 1..cap.len() {
+            if let Ok(v) = cap[i].replace('_', "").parse::<u64>() {
+                sum += v;
+            }
+        }
+    }
+    for cap in re.captures_iter(err) {
+        for i in 1..cap.len() {
+            if let Ok(v) = cap[i].replace('_', "").parse::<u64>() {
+                sum += v;
+            }
+        }
+    }
+    sum
+}
+
 /// Simple CLI for the MVP fuzzer.
 #[derive(Parser, Debug)]
 #[command(name="temujsx")]
@@ -48,6 +67,23 @@ struct Args {
     /// Timeout per run (e.g., 500ms, 2s). Defaults to 500ms.
     #[arg(long, default_value="500ms")]
     timeout: humantime::Duration,
+
+    /// Optional: extra args for the scoring pass (run #2)
+    #[arg(long, value_delimiter=' ', num_args=0..)]
+    score_cmd_args: Vec<String>,
+
+    /// Regex to extract numeric coverage score from stdout+stderr of scoring pass.
+    /// All captures are parsed as integers and summed.
+    #[arg(long, default_value="")]
+    score_regex: String,
+
+    /// Keep only coverage-increasing inputs (requires score_regex).
+    #[arg(long, default_value_t=false)]
+    keep_only_increasing: bool,
+
+    /// Minimizer mode: "signature" or "coverage"
+    #[arg(long, default_value="signature")]
+    minimize_by: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -68,6 +104,10 @@ fn main() -> anyhow::Result<()> {
     let mut syntax_errors = 0usize;
     let mut crashes = 0usize;
     let mut timeouts = 0usize;
+    let mut best_score: u64 = 0;
+    let score_re = if !args.score_regex.is_empty() {
+        Some(Regex::new(&args.score_regex).expect("invalid --score-regex"))
+    } else { None };
 
     for i in 0..args.iters {
         // pick a random seed and extract template
@@ -107,32 +147,64 @@ fn main() -> anyhow::Result<()> {
             syntax_errors += 1;
         }
 
+        // Optional coverage scoring pass
+        let mut cov_score: Option<u64> = None;
+        if let Some(re) = &score_re {
+            let score_run = eng.run_js_with_args(&prog, &args.score_cmd_args)?;
+            let s = score_with_regex(&score_run.stdout, &score_run.stderr, re);
+            cov_score = Some(s);
+        }
+
+        // Decide whether this is "interesting enough" to save/promote
+        let is_increasing = if let Some(s) = cov_score { s > best_score } else { false };
+
         if outcome.timed_out {
-            timeouts += 1;
-            let sig = crash_signature(&outcome.stderr);
-            if seen.insert(sig.clone()) {
-                let path = args.out.join(format!("timeout_iter{}_sig{}.js", i, &sig[..8]));
-                std::fs::write(&path, &prog)?;
-                let stderr_path = args.out.join(format!("timeout_iter{}_sig{}.stderr.txt", i, &sig[..8]));
-                std::fs::write(&stderr_path, &outcome.stderr)?;
+            // Gate on increasing coverage if requested
+            if args.keep_only_increasing && score_re.is_some() && !is_increasing {
+                // skip saving; not increasing coverage
+            } else {
+                if let Some(s) = cov_score {
+                    if s > best_score { best_score = s; }
+                }
+                timeouts += 1;
+                let sig = crash_signature(&outcome.stderr);
+                if seen.insert(sig.clone()) {
+                    let path = args.out.join(format!("timeout_iter{}_sig{}.js", i, &sig[..8]));
+                    std::fs::write(&path, &prog)?;
+                    let stderr_path = args.out.join(format!("timeout_iter{}_sig{}.stderr.txt", i, &sig[..8]));
+                    std::fs::write(&stderr_path, &outcome.stderr)?;
+                }
             }
         } else if outcome.status != 0 && !is_syntax_error {
             let boring = outcome.stderr.contains("ReferenceError:") && !outcome.stderr.contains("prototype");
             if !boring {
-                let sig = crash_signature(&outcome.stderr);
-                if seen.insert(sig.clone()) {
-                    crashes += 1;
-                    // Minimize the crash
-                    let minimized = match kre8ntemjs_core::minimizer::minimize_by(&prog, &eng, |stderr| {
-                        crash_signature(stderr) == sig
-                    }) {
-                        Ok(m) => m,
-                        Err(_) => prog.clone(),
-                    };
-                    let path = args.out.join(format!("crash_iter{}_sig{}.js", i, &sig[..8]));
-                    std::fs::write(&path, &minimized)?;
-                    let stderr_path = args.out.join(format!("crash_iter{}_sig{}.stderr.txt", i, &sig[..8]));
-                    std::fs::write(&stderr_path, &outcome.stderr)?;
+                // Gate on increasing coverage if requested
+                if args.keep_only_increasing && score_re.is_some() && !is_increasing {
+                    // skip saving; not increasing coverage
+                } else {
+                    if let Some(s) = cov_score {
+                        if s > best_score { best_score = s; }
+                    }
+                    let sig = crash_signature(&outcome.stderr);
+                    if seen.insert(sig.clone()) {
+                        crashes += 1;
+                        // Minimize the crash
+                        let minimized = if args.minimize_by == "coverage" && score_re.is_some() {
+                            let score_run = eng.run_js_with_args(&prog, &args.score_cmd_args)?;
+                            let target = score_with_regex(&score_run.stdout, &score_run.stderr, score_re.as_ref().unwrap());
+                            kre8ntemjs_core::minimize_preserving_coverage(
+                                &prog, &eng, &args.score_cmd_args, score_re.as_ref().unwrap(), target
+                            ).unwrap_or(prog.clone())
+                        } else {
+                            // signature mode
+                            kre8ntemjs_core::minimizer::minimize_by(&prog, &eng, |stderr| crash_signature(stderr) == sig)
+                                .unwrap_or(prog.clone())
+                        };
+                        let path = args.out.join(format!("crash_iter{}_sig{}.js", i, &sig[..8]));
+                        std::fs::write(&path, &minimized)?;
+                        let stderr_path = args.out.join(format!("crash_iter{}_sig{}.stderr.txt", i, &sig[..8]));
+                        std::fs::write(&stderr_path, &outcome.stderr)?;
+                    }
                 }
             }
         }

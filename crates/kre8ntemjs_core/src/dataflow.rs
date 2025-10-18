@@ -1,10 +1,9 @@
 use anyhow::Result;
 use std::collections::HashMap;
-use tree_sitter::{Node, Parser, Tree, Language};
+use tree_sitter::{Parser, Tree, Language};
 
 extern "C" { fn tree_sitter_javascript() -> Language; }
 
-#[derive(Default)]
 pub struct JsDf {
     parser: Parser,
 }
@@ -35,7 +34,6 @@ impl JsDf {
 /// - USE: identifiers appearing in expressions not being declared.
 /// NOTE: This is intentionally lightweight; you can refine it later.
 fn collect_defs_uses(tree: &Tree, _src: &str) -> DfReport {
-    use std::collections::HashSet;
     let root = tree.root_node();
     let mut defs: HashMap<String, usize> = HashMap::new();
     let mut uses: HashMap<String, usize> = HashMap::new();

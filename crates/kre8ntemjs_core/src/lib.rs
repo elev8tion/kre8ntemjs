@@ -15,6 +15,8 @@ pub mod ast;
 pub mod minimizer;
 pub mod dataflow;
 
+pub use minimizer::minimize_preserving_coverage;
+
 #[derive(Debug, Error)]
 pub enum FuzzError {
     #[error("engine failed with status: {0}")]
@@ -72,7 +74,7 @@ impl Extractor {
     pub fn extract(&self, src: &str) -> Template {
         // AST path (existing)
         let mut js = crate::ast::JsAst::default();
-        if let Ok(tree) = js.parse(src) {
+        if let Some(tree) = js.parse(src) {
             use rand::{thread_rng, Rng};
             use crate::dataflow::{JsDf, dfcomp};
 
