@@ -51,6 +51,28 @@ We use a tiny wrapper (`tools/scorewrap`) so the fuzzer can stay engine-agnostic
 cargo build -p scorewrap
 ```
 
+### Testing with Mock Engine
+
+Use the included mock engine to test the coverage workflow without building instrumented d8:
+
+```bash
+# Test mock engine directly
+./tools/mock_engine.py --js seeds/example.js --write-file
+
+# Run fuzzer with mock engine
+cargo run -p kre8ntemjs_cli -- \
+  --engine-cmd target/debug/scorewrap \
+  --engine-args "--engine $(pwd)/tools/mock_engine.py --engine-args --write-file --edges-file /tmp/kre8_edges.txt" \
+  --seeds ./seeds \
+  --out ./artifacts \
+  --iters 500 \
+  --score-regex 'edges:(\d+)' \
+  --keep-only-increasing \
+  --minimize-by coverage
+```
+
+See `tools/README_MOCK.md` for full mock engine documentation.
+
 ### Option 1: File-based counter (recommended)
 Instrument your engine to write edge count to `/tmp/kre8_edges.txt`:
 ```bash
