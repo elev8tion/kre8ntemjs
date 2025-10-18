@@ -1,6 +1,10 @@
 
 [workspace]
-members = ["crates/kre8ntemjs_core", "crates/kre8ntemjs_cli"]
+members = [
+  "crates/kre8ntemjs_core",
+  "crates/kre8ntemjs_cli",
+  "tools/scorewrap"
+]
 
 [workspace.package]
 edition = "2021"

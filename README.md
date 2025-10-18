@@ -1,17 +1,20 @@
 
-# TemuJsX — Template-based JS Engine Fuzzer (from scratch)
+# Kre8ntemJS — Template-based JS Engine Fuzzer
 
-A clean-room, modular reimplementation of a high-level, **template-based** JavaScript engine fuzzer you can fully own and customize.
+A modular, **template-based** JavaScript engine fuzzer with dataflow analysis and coverage-guided fuzzing capabilities.
 
-## Features (MVP)
-- Seed → Template extraction via simple, pluggable rules (regex-based starter).
-- High-level mutations: insertion, deletion, substitution, fusion.
-- Concretization of placeholders with a context-aware generator (MVP minimal context).
-- Engine runner adapters (shell out to `d8`, `jsc`, `js`/`spidermonkey`) with timeouts.
-- Crash triage: exit codes + stderr fingerprint, auto-save repro cases.
-- CLI for batch fuzzing over a seed corpus.
+## Features
+- **AST-based extraction** with Tree-sitter for semantic-aware template generation
+- **Dataflow-aware fuzzing** using def/use analysis to bias variable selection
+- **Coverage-guided mode** with external scoring and increasing-only gate
+- **Dual minimizer modes**: signature-preserving or coverage-preserving
+- **Crash deduplication** with SHA1-based signature hashing
+- High-level mutations: insertion, deletion, substitution, fusion
+- Scope-coherent concretization (reuses in-template identifiers)
+- Engine adapters for d8, jsc, spidermonkey with configurable timeouts
+- Boring crash filtering (de-prioritizes simple ReferenceErrors)
 
-> This is intentionally minimal to get you started. Each module has `TODO` markers for deeper engines, coverage, and smarter extraction/mutation.
+> Production-ready fuzzing infrastructure with instrumented engine support via `scorewrap`.
 
 ## Quick start
 ```bash
@@ -19,30 +22,90 @@ A clean-room, modular reimplementation of a high-level, **template-based** JavaS
 curl https://sh.rustup.rs -sSf | sh
 
 # 2) Build
-cd temujsx
+cd kre8ntemjs
 cargo build
 
-# 3) Run a quick smoke fuzz (requires a JS engine, e.g. V8's d8 on PATH)
-cargo run -p temujsx_cli --   --engine-cmd "d8"   --seeds ./seeds   --out ./artifacts   --iters 1000 --timeout 500ms
+# 3) Run basic fuzzing (requires a JS engine, e.g. V8's d8)
+cargo run -p kre8ntemjs_cli -- \
+  --engine-cmd "d8" \
+  --seeds ./seeds \
+  --out ./artifacts \
+  --iters 1000 \
+  --timeout 500ms
 ```
 
 ## CLI
 ```
-temujsx --engine-cmd <cmd> --seeds <dir> --out <dir> [--iters N] [--timeout 500ms]
+kre8ntemjs_cli --engine-cmd <cmd> --seeds <dir> --out <dir> [--iters N] [--timeout 500ms]
 ```
 
-## Layout
-- `crates/temujsx_core` — core traits, template data types, extractor/mutator/concretizer, runner utils.
-- `crates/temujsx_cli` — command-line entry point.
+## Coverage Guidance (Option B: Instrumented Engine + Wrapper)
 
-## Roadmap (suggested)
-- [ ] Coverage adapters (sanitizer-coverage, pcguard, or engine-native flags).
-- [ ] Smarter, AST-level extraction (Tree-sitter) and placeholder design.
-- [ ] Dataflow-aware substitution heuristics.
-- [ ] Structured fusion/splicing using CFG/DFG.
-- [ ] Minimization and delta-debugging.
-- [ ] Distributed scheduling.
-- [ ] Crash dedup via stack hashes and root-cause clustering.
+We use a tiny wrapper (`tools/scorewrap`) so the fuzzer can stay engine-agnostic. The wrapper:
+- Runs the real engine (instrumented).
+- Reads a coverage count either from a file (preferred) or by regex.
+- Prints `edges:<N>` so the fuzzer can parse it and keep only coverage-increasing programs.
+
+### Build the wrapper
+```bash
+cargo build -p scorewrap
+```
+
+### Option 1: File-based counter (recommended)
+Instrument your engine to write edge count to `/tmp/kre8_edges.txt`:
+```bash
+cargo run -p kre8ntemjs_cli -- \
+  --engine-cmd target/debug/scorewrap \
+  --engine-args "--engine /path/to/instrumented/d8 --engine-args --your-flags --edges-file /tmp/kre8_edges.txt" \
+  --seeds ./seeds \
+  --out ./artifacts \
+  --iters 2000 \
+  --timeout 500ms \
+  --score-cmd-args "" \
+  --score-regex 'edges:(\d+)' \
+  --keep-only-increasing \
+  --minimize-by coverage
+```
+
+### Option 2: Regex-based counter
+If your engine prints `edges: 12345` to stdout/stderr:
+```bash
+cargo run -p kre8ntemjs_cli -- \
+  --engine-cmd target/debug/scorewrap \
+  --engine-args "--engine /path/to/instrumented/d8 --engine-args --your-flags --score-regex edges:\s*(\d+)" \
+  --seeds ./seeds \
+  --out ./artifacts \
+  --iters 2000 \
+  --timeout 500ms \
+  --score-cmd-args "" \
+  --score-regex 'edges:(\d+)' \
+  --keep-only-increasing \
+  --minimize-by coverage
+```
+
+**Benefits:**
+- Only saves coverage-increasing test cases
+- Minimizer preserves coverage while shrinking crashes
+- Works with any instrumented engine (d8, jsc, custom)
+
+## Layout
+- `crates/kre8ntemjs_core` — Core fuzzing infrastructure (AST, dataflow, extractor, mutator, concretizer, minimizer)
+- `crates/kre8ntemjs_cli` — Command-line fuzzer
+- `tools/scorewrap` — Coverage wrapper for instrumented engines
+
+## Implemented Features
+- [x] AST-level extraction with Tree-sitter
+- [x] Dataflow-aware substitution heuristics (DFComp)
+- [x] Coverage-guided fuzzing with external scoring
+- [x] Dual minimization modes (signature/coverage)
+- [x] Crash deduplication via normalized stack hashing
+- [x] Boring crash filtering
+
+## Roadmap
+- [ ] Structured fusion/splicing using CFG/DFG analysis
+- [ ] Distributed fuzzing coordinator
+- [ ] Custom instrumentation integration
+- [ ] Taint tracking for input-to-crash correlation
 
 ## License
 MIT or Apache-2.0, at your option.

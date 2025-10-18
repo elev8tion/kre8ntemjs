@@ -422,6 +422,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scorewrap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "regex",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
